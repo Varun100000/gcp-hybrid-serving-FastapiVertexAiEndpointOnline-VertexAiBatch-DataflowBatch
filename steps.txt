@@ -1,0 +1,208 @@
+- create new project
+- enable apis
+- create cloud storage bucket and subfolders
+- create artifact registry
+- create service account
+- make folder structure
+        - hybrid-recommendation-serving/
+              data/
+              src/
+              serving/
+              api/
+              dataflow/
+              sql/
+              README.md
+- generate synthetic data
+    - hybrid-recommendation-serving/
+          src/
+            generate_products.py
+                - The catalog contains:
+                        - product metadata
+                        - popularity score
+                        - head/tail product flag
+
+                Head products are the top 20% by popularity.
+                These will be precomputed by batch serving.
+
+                Tail products are the remaining 80%.
+                These will fall back to online serving.
+
+- train a simple model
+    - hybrid-recommendation-serving/
+          src/
+            train_model.py
+
+    -Train a tiny product similarity model.
+            This is not a deep learning model.
+            It is intentionally simple because the project is about MLOps serving patterns,
+            not complex model accuracy.
+
+            The model:
+            - reads product metadata from data/products.csv
+            - converts category and brand into one-hot encoded features
+            - scales numeric fields like price and rating
+            - finds nearest products using cosine distance - # NOTHING FANCY
+            - saves everything needed for prediction into model/model.joblib
+
+- test model locally before moving it to GCP
+    - hybrid-recommendation-serving/
+          src/
+            train_recommendation_model.py
+
+- single unified reusable prediction module which can be used for all - local, vertex ai online serving, vertex ai batch serving, dataflow batch scoring
+    - hybrid-recommendation-serving/
+          data/
+          src/
+            recommendation_model.py
+            
+        - no need to load model everytime for every request -for batch request, load model only once 
+        
+- upload synthesized data and trained model artifact to gcs bucket
+- create big query tables from uploaded data in GCS bucket - 3 tables inside the created dataset - for all products, head_product and tail_product
+- create Vertex AI Online Serving container
+    - container will load model from model/model.joblib from gcs bucket folder
+    - and container will expose a prediction api that vertex ai can call
+    - container code 
+        - hybrid-recommendation-serving/
+                serving/
+                      Dockerfile  
+                                # setting environment to keep python output visible in container logs
+                                # install dependencies from requirements, copies app.py, copies model.joblib, launches fastapi app in a production style server using uvicorn in 8080 port  
+                                # copying model artifact model.joblib directly into the serving image 
+                                # FOR LARGER MODELS IN PRODUCTION, CONTAINER CAN LOAD MODEL ARTIFACT FROM CLOUD STORAGE AT START, INSTEAD OF BAKING IT INTO THE IMAGE ITSELF
+                      requirements.txt #import flask, gunicorn, pandas, sklearn, joblib
+                      app.py
+                            - exposes 2 things 
+                                - health - # vertex ai uses this to check whether container is alive or not
+                                - predict - # vertex ai sends prediction requests here - send request in json, get response in json
+    - Vertex AI Endpoint > run Custom Docker Container > container contains Flask app + Gunicorn server + model.joblib
+            - Vertex AI Endpoint is the managed serving platform.
+            - Flask/Gunicorn is the container’s HTTP interface.
+    - Why not “just use Vertex AI Endpoint” without Flask?
+            - Because Vertex AI Endpoint does not magically know how to call your model.joblib. You have two choices:
+                    - Option 1: Prebuilt Vertex AI prediction container -  Good when your model format matches a supported framework cleanly.- This can reduce custom code, but it is stricter about model format and request/response behavior.
+                    - Option 2: Custom prediction container
+                            - THIS IS WHAT WE ARE DOING
+                            - USING THIS OPTION SINCE the recommendation response required custom post-processing and a structured top-k output, not just a single model score.
+                            - THIS IS WHAT WE ARE DOING 
+                                    - Client / Cloud Run API -> Vertex AI Endpoint -> Custom prediction containeR -> Flask /predict route -> model recommends products
+- preparing config file for vertex ai online container build and register inside artifact registry
+        - hybrid-recommendation-serving/
+                cloudbuild.yaml- # config file for cloud build
+
+- build the image and register in artifact registry - using cloud build
+
+- create model registry in vertex ai model registry
+    - Import in vertex ai model monitoring > Import as new model > import as existing custom container > container image will be the serving container which we created in artifact registry
+    - NO NEED TO PUT THE MODEL ARTIFACT LOCATION SINCE CONTAINER LOADS THE MODEL INSIDE ITS MEMORY ALREADY
+    - Under inference model and health mode, mention /predict and /health which is what the container does using the fast api app - app.py
+
+- once model is registered in vertex ai model registry > deploy model endpoint > create new endpoint > select model > max and min replicas make it 1 > select machine > deploy
+
+- test the vertex ai online endpoint
+        - 
+        
+- undeploy model from endpoint > delete endpoint ## saves cost of machine running
+
+- Batch Serving using Vertex Ai Batch Prediction
+        - This will create precomputed recommendations for head products.
+        - Run a Vertex AI Batch Prediction job that sends only the head products to the model 
+        - writes prediction output to Cloud Storage.
+        - Steps 
+                - head_products input
+                        ↓
+                - Vertex AI Batch Prediction
+                        ↓
+                - Cloud Storage output
+                        ↓
+                - load that output into BigQuery as the lookup table.                
+                
+        - create json line inputs # vertex ai batch predictions accepts JSON Line input and not csv
+                - create batch
+                        -input/head_products.jsonl
+                - each line should look like 
+                        -{"product_id": "P00042", "top_k": 5}
+                - create this file 
+                        - src/generate_batch_input.py # reads head product csv file line by line and deumps it as json in the jsonl file 
+                - run the above file to create a json dump of the head products 
+        - upload json file in cloud storage bucket inside /hybrid-rec-demo-varun/batch-input
+        
+        - create vertex ai batch prediction job
+                - vertex ai batch inference > create > select model from model registty, input json gcs bucket location, output json gcs bucket folder location > machine type > num of nodes (for parallelism) > service account
+                - check status of batch inference job
+                - output json with product recommendation for each product in input json is created in the batch output bucket
+        - turn the Vertex Batch Prediction output into a BigQuery lookup table.
+                - go to big query dataset > create table > create table from GCS > source file, file format json, new table name , schema -auto detec > THIS CREATES A NESTED JSON BQ TABLE
+                - FLATTEN THE NESTED BIG QUERY TABLE - AND CREATE A NEW FINAL TABLE WHICH IS FLATTENED
+                
+        - build the Cloud Run hybrid router API
+            - this API will
+                - Client asks for recommendations
+                        ↓
+                - Cloud Run API checks BigQuery lookup table
+                        ↓
+                - If found: return batch recommendations
+                        ↓
+                - If not found: call Vertex AI Endpoint
+                   
+            - folder setup
+                - hybrid-recommendation-serving
+                    /api
+                        - requirements.txt # fastapi, uvicorn, pydantic, gcloud_bigquery, gcloud_aiplatform
+                        - Dockerfile  # from python 3.11 slim, installs requirements, copies main.py, exposes fastapi main.py web application to 8080 port
+                        - main.py
+                                - hides serving strategy (online used or batch used when client asks for recommendation)
+                                - for every recommendation requested for every product id, it checks if the product is present in the big quuery table (which has recommendations precomputed using vertex ai batch request)
+                                        - if present then return recommendations from the big query
+                                        - else call vertex ai endpoint for online prediction
+            
+            - docker container for cloud run to use # cloud run can install it across multiple machines and scale it as and when required to run this application
+                    - cloudbuild-api.yaml
+                                - ths is for creating the docker container and registering it in artifact registry
+            - Deploy To Cloud Run Using Console UI
+                    - cloud run > services > create service > existing docker container from artifact registry > container url > name > min max replica > container environments like project id, endpoint id, big query table etc, service account name > create
+            - test your cloud run
+                    - go to url of the cloud run service created 
+                            - https://hybrid-recommendation-api-694139999265.us-central1.run.app
+                            - amend this url 
+                                - https://hybrid-recommendation-api-694139999265.us-central1.run.app/recommendations/P00042?top_k=5
+                                - #source attribute in the output should tell the source - batch or online
+                
+- Batch Serving using Dataflow batch scoring
+        - BigQuery head_products
+                ↓
+        - Dataflow workers
+                ↓   
+        - Each worker loads model from GCS
+                ↓
+        - Writes recommendations to BigQuery
+    
+    - Create a second lookup table: hybrid_rec.recommendation_lookup_dataflow
+            - This proves the same batch lookup can be produced using custom distributed batch processing.
+    - files 
+            - hybrid-recommendation-serving/dataflow/requirements.txt # packages to be installed - apache beam, sklearn, pandas and joblib
+            - hybrid-recommendation-serving/dataflow/batch_score.py #main apache beam pipeline code 
+                         
+            - hybrid-recommendation-serving/src/__init__.py # empty file # lets Dataflow package your shared model code.
+            - hybrid-recommendation-serving/setup.py # has setuptools library which finds and creates package
+                    - has find_packages() command which first looks for folder which has __init__.py() and packages all the codes inside that folder
+                    - find_packages() does not package plain folders unless they have __init__.py.
+                    - files inside the folder dataflow will not be packaged
+                        - Main pipeline program- dataflow/batch_score.py. Submitted directly.
+                        - dataflow/requirements.txt - Not discovered by setup.py; passed explicitly with: --requirements_file dataflow/requirements.txt
+            -  classic python dataflow job 
+                    - pipeline file + setup.py + requirements.txt # this is what we are using
+                    - # could have containerized it with docker and used Dataflow custom container but not showing this for now
+    - move these files into cloud shell editor
+    - create and activate a temporary Python environment just for the Dataflow job inside cloud shell
+            - isolated python environment in cloud shell - # this is where we will install the requirements for the dataflow job
+                    - keeps Dataflow packages separate from Cloud Shell’s default Python
+                    - avoids dependency conflicts
+            - even though the requirements are to be installed inside each worker in dataflow, but it is also required to be installed inside the cloud shell from where we launch the data flow job
+                    - before the job is sent to dataflow workers, cloud shell must execute our python script enough to 
+                        - import apache beam, parse pipeline code, build the pipeline graph, stage files to gcs, sunmit job to dataflow
+    - launch dataflow job from cloud shell
+    - track dataflow job via graph
+    - check to see if the big query table for dataflow is now ready with the output    
+                    
+        

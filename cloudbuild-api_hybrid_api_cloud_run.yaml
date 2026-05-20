@@ -1,0 +1,12 @@
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "api/Dockerfile"
+      - "-t"
+      - "us-central1-docker.pkg.dev/hybrid-serving-static-dynamic/hybrid-rec/hybrid-api:latest"
+      - "."
+
+images:
+  - "us-central1-docker.pkg.dev/hybrid-serving-static-dynamic/hybrid-rec/hybrid-api:latest"

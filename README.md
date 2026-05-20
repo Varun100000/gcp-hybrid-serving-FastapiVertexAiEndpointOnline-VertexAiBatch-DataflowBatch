@@ -316,7 +316,7 @@ This project was intentionally designed to stay small:
 
 ## Screenshots 
 
-[Project Screenshots here - Step by Step implementation](project_screenshots/)
+[Project Screenshots here - Step by Step implementation](project_snapshots/)
 
 ## Step by Step - how to?
 
